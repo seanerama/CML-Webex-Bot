@@ -8,6 +8,7 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 
 from agent import CMLAgent
 from mcp_bridge import MCPBridge
@@ -129,6 +130,202 @@ async def health():
         "mcp_tools": len(mcp.get_anthropic_tools()) if mcp else 0,
         "ngrok_url": NGROK_URL,
     }
+
+
+@app.get("/lab", response_class=HTMLResponse)
+async def lab_page():
+    """Show current lab state with management IPs."""
+    import json as _json
+
+    lab_data = {"labs": [], "error": None}
+    try:
+        result = await mcp.call_tool("get_cml_labs", {})
+        labs = _json.loads(result) if result.startswith("[") else []
+
+        for lab in labs:
+            if not isinstance(lab, dict):
+                continue
+            lid = lab.get("id", "")
+            lab_info = {
+                "id": lid,
+                "title": lab.get("lab_title", "?"),
+                "state": lab.get("state", "?"),
+                "nodes": [],
+            }
+            if lab.get("state") == "STARTED":
+                # Get nodes
+                nodes_result = await mcp.call_tool("get_nodes_for_cml_lab", {"lid": lid})
+                nodes = _json.loads(nodes_result) if nodes_result.startswith("[") else []
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    nd = node.get("node_definition", "")
+                    if nd in ("unmanaged_switch", "external_connector"):
+                        continue
+                    # Get management IP via L3 addresses
+                    mgmt_ip = ""
+                    try:
+                        nid = node.get("id", "")
+                        l3_result = await mcp.call_tool("get_nodes_for_cml_lab", {"lid": lid})
+                        # Try send_cli_command for IP
+                        ip_result = await mcp.call_tool("send_cli_command", {
+                            "lid": lid, "label": node.get("label", ""),
+                            "commands": "show ip interface brief | include Ethernet0/0"
+                        })
+                        # Parse: "Ethernet0/0  192.168.255.x  YES DHCP  up  up"
+                        for line in ip_result.split("\n"):
+                            if "Ethernet0/0" in line and "DHCP" in line:
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    mgmt_ip = parts[1]
+                    except Exception:
+                        pass
+
+                    lab_info["nodes"].append({
+                        "label": node.get("label", "?"),
+                        "state": node.get("state", "?"),
+                        "mgmt_ip": mgmt_ip,
+                        "node_definition": nd,
+                    })
+            lab_data["labs"].append(lab_info)
+    except Exception as e:
+        lab_data["error"] = str(e)
+
+    # Render HTML
+    html = """<!DOCTYPE html>
+<html><head>
+<title>CML Lab Status</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e17; color: #e2e8f0; max-width: 900px; margin: 40px auto; padding: 0 20px; }
+  h1 { color: #00ff88; font-size: 1.5em; }
+  h2 { color: #64bbe3; font-size: 1.2em; margin-top: 2em; }
+  .lab { background: #1a1f2e; border-radius: 8px; padding: 16px 20px; margin: 12px 0; border-left: 3px solid #00ff88; }
+  .lab.stopped { border-left-color: #64748b; }
+  .lab-title { font-weight: bold; font-size: 1.1em; }
+  .lab-state { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; margin-left: 8px; }
+  .lab-state.STARTED { background: #00ff8833; color: #00ff88; }
+  .lab-state.STOPPED { background: #64748b33; color: #64748b; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th { text-align: left; padding: 8px; border-bottom: 1px solid #334155; color: #94a3b8; font-size: 0.85em; }
+  td { padding: 8px; border-bottom: 1px solid #1e293b; }
+  .ip { font-family: monospace; color: #00ff88; font-weight: bold; cursor: pointer; }
+  .ip:hover { text-decoration: underline; }
+  .creds { background: #1a1f2e; border-radius: 8px; padding: 16px 20px; margin: 12px 0; font-family: monospace; }
+  .creds span { color: #ffaa00; }
+  .copy-btn { background: #334155; border: none; color: #e2e8f0; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; margin-left: 8px; }
+  .copy-btn:hover { background: #475569; }
+  .empty { color: #64748b; font-style: italic; }
+  #copied { display: none; color: #00ff88; font-size: 0.8em; margin-left: 8px; }
+</style>
+<script>
+function copyIPs() {
+  const ips = [...document.querySelectorAll('.ip')].map(el => el.textContent).filter(Boolean);
+  navigator.clipboard.writeText(ips.join(','));
+  document.getElementById('copied').style.display = 'inline';
+  setTimeout(() => document.getElementById('copied').style.display = 'none', 2000);
+}
+function copyTable() {
+  const rows = [...document.querySelectorAll('tbody tr')].map(tr => {
+    const cells = [...tr.querySelectorAll('td')];
+    return cells.map(c => c.textContent.trim()).join('\\t');
+  });
+  navigator.clipboard.writeText(rows.join('\\n'));
+}
+</script>
+</head><body>
+<h1>CML Lab Status</h1>"""
+
+    if lab_data["error"]:
+        html += f'<p style="color:#ff3355">Error: {lab_data["error"]}</p>'
+
+    if not lab_data["labs"]:
+        html += '<p class="empty">No labs found.</p>'
+
+    for lab in lab_data["labs"]:
+        state_class = lab["state"]
+        html += f'''<div class="lab {state_class.lower()}">
+<span class="lab-title">{lab["title"]}</span>
+<span class="lab-state {state_class}">{state_class}</span>
+<br><small style="color:#64748b">ID: {lab["id"]}</small>'''
+
+        if lab["nodes"]:
+            ips = [n["mgmt_ip"] for n in lab["nodes"] if n["mgmt_ip"]]
+            html += f'''
+<div style="margin-top:8px">
+  <button class="copy-btn" onclick="copyIPs()">Copy IPs</button>
+  <span id="copied">Copied!</span>
+</div>
+<table><thead><tr><th>Device</th><th>State</th><th>Management IP</th><th>Type</th></tr></thead><tbody>'''
+            for node in lab["nodes"]:
+                ip_display = f'<span class="ip">{node["mgmt_ip"]}</span>' if node["mgmt_ip"] else '<span class="empty">pending</span>'
+                html += f'<tr><td>{node["label"]}</td><td>{node["state"]}</td><td>{ip_display}</td><td>{node["node_definition"]}</td></tr>'
+            html += '</tbody></table>'
+        else:
+            html += '<p class="empty">No router nodes (lab may not be started)</p>'
+
+        html += '</div>'
+
+    html += '''
+<h2>SSH Credentials</h2>
+<div class="creds">
+  <span>hacker</span> / BreakMe123 &nbsp;(audience access)<br>
+  <span>herbie</span> / H3rb13!Ops &nbsp;(operations access)
+</div>
+<p style="color:#64748b;font-size:0.8em">Auto-refreshes every 30 seconds</p>
+</body></html>'''
+
+    return HTMLResponse(content=html)
+
+
+@app.get("/lab/json")
+async def lab_json():
+    """API endpoint for lab data — returns JSON with management IPs."""
+    import json as _json
+    labs = []
+    try:
+        result = await mcp.call_tool("get_cml_labs", {})
+        raw_labs = _json.loads(result) if result.startswith("[") else []
+        for lab in raw_labs:
+            if not isinstance(lab, dict) or lab.get("state") != "STARTED":
+                continue
+            lid = lab.get("id", "")
+            nodes_result = await mcp.call_tool("get_nodes_for_cml_lab", {"lid": lid})
+            nodes = _json.loads(nodes_result) if nodes_result.startswith("[") else []
+            device_list = []
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                nd = node.get("node_definition", "")
+                if nd in ("unmanaged_switch", "external_connector"):
+                    continue
+                mgmt_ip = ""
+                try:
+                    ip_result = await mcp.call_tool("send_cli_command", {
+                        "lid": lid, "label": node.get("label", ""),
+                        "commands": "show ip interface brief | include Ethernet0/0"
+                    })
+                    for line in ip_result.split("\n"):
+                        if "Ethernet0/0" in line and "DHCP" in line:
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                mgmt_ip = parts[1]
+                except Exception:
+                    pass
+                device_list.append({
+                    "hostname": node.get("label", ""),
+                    "mgmt_ip": mgmt_ip,
+                    "state": node.get("state", ""),
+                })
+            labs.append({
+                "id": lid,
+                "title": lab.get("lab_title", ""),
+                "devices": device_list,
+                "ssh_users": {"hacker": "BreakMe123", "herbie": "H3rb13!Ops"},
+            })
+    except Exception as e:
+        return {"error": str(e)}
+    return {"labs": labs}
 
 
 @app.post("/webhook")
