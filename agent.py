@@ -32,11 +32,17 @@ When a user describes a network topology (text or whiteboard photo), follow this
 6. **STOP and wait for the user to confirm.** Do NOT call create_full_lab_topology until the user says yes/confirm/deploy/go.
 
 ### Phase 2 — Deploy (only after user confirms)
-1. Create the lab with create_full_lab_topology
-2. Start with start_cml_lab (wait_for_convergence=true)
-3. Get node states with get_nodes_for_cml_lab
-4. Verify connectivity using send_cli_command (show ip ospf neighbor, ping between loopbacks)
-5. Report the final state: device hostnames, management IPs, SSH credentials
+Build the lab step by step using these tools in order:
+1. `create_empty_lab` with a title
+2. For each node (routers + mgmt-sw + ext-conn): `add_node_to_cml_lab` with label, node_definition, x, y
+3. For each router: `configure_cml_node` with the startup config
+4. For each link: `connect_two_nodes` with src_int and dst_int (interface UUIDs from add_node responses)
+5. `start_cml_lab` with wait_for_convergence=true
+6. `get_nodes_for_cml_lab` to check states
+7. `send_cli_command` to verify connectivity (show ip ospf/bgp neighbor, ping loopbacks)
+8. Report: device hostnames, management IPs, SSH credentials
+
+IMPORTANT: Do NOT use create_full_lab_topology — it has schema issues. Always use the step-by-step approach above.
 
 ### Other commands
 When asked to tear down: use delete_cml_lab (it auto-stops and wipes).
@@ -67,13 +73,15 @@ When asked about CML status/resources: use get_cml_statistics and get_cml_status
   - `ip ssh version 2` / `crypto key generate rsa modulus 2048`
   - `interface Ethernet0/0` / `ip address dhcp` / `no shutdown`
 
-## Topology JSON format for create_full_lab_topology
+## Step-by-step lab building notes
 
-The `lab` parameter must be a dict with keys: title, version ("0.3.0"), description.
-The `nodes` parameter must be a list of node dicts. Each router node needs: id, label, node_definition, image_definition, x, y, configuration, interfaces (list of {id, label, slot, type}).
-The `links` parameter must be a list of link dicts: {id, src_node (node id), src_interface (interface id), dst_node, dst_interface}.
-
-Interface IDs must be globally unique (i0, i1, i2...). Node IDs must be unique (n0, n1, n2...).
+- `add_node_to_cml_lab` returns a node object with an `id` — save this for linking
+- `get_interfaces_for_node` returns the node's interfaces with their UUIDs — use these for `connect_two_nodes`
+- `configure_cml_node` sets the startup config — the node must be in CREATED state (before starting)
+- `connect_two_nodes` takes `src_int` and `dst_int` which are interface UUIDs (not labels)
+- After adding all nodes, call `get_interfaces_for_node` for each to discover interface UUIDs
+- Then create links with `connect_two_nodes` using those UUIDs
+- For the external connector, set its config to "System Bridge" using `configure_cml_node`
 
 ## Output format
 
