@@ -54,7 +54,7 @@ When asked about CML status/resources: use get_cml_statistics and get_cml_status
 - Use Ethernet0/1, Ethernet0/2, etc. for data links between routers
 - Always include management infrastructure:
   - An `unmanaged_switch` node labeled "mgmt-sw" with enough ports for all routers + 1
-  - An `external_connector` node labeled "ext-conn" with configuration "NAT"
+  - An `external_connector` node labeled "ext-conn" with configuration "System Bridge" (NOT NAT — bridge mode makes routers directly reachable on the network)
   - Link each router's Ethernet0/0 to a port on mgmt-sw
   - Link ext-conn to the last port on mgmt-sw
 - Each router config should include:
