@@ -29,6 +29,10 @@ notifier: WebexNotifier = None
 BOT_ID: str = ""
 NGROK_URL: str = ""
 
+# Cached lab data — refreshed in background
+_lab_cache: dict = {"labs": [], "error": None, "last_updated": None}
+_cache_lock = asyncio.Lock()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,6 +79,9 @@ async def lifespan(app: FastAPI):
         logger.warning("No NGROK_AUTHTOKEN — webhook won't be reachable externally")
 
     logger.info("cml-manager ready")
+
+    # Start background lab cache refresh
+    asyncio.create_task(_refresh_lab_cache_loop())
 
     yield
 
@@ -132,12 +139,12 @@ async def health():
     }
 
 
-@app.get("/lab", response_class=HTMLResponse)
-async def lab_page():
-    """Show current lab state with management IPs."""
+async def _refresh_lab_cache() -> None:
+    """Fetch lab data and update cache."""
     import json as _json
+    global _lab_cache
 
-    lab_data = {"labs": [], "error": None}
+    lab_data = {"labs": [], "error": None, "last_updated": None}
     try:
         result = await mcp.call_tool("get_cml_labs", {})
         labs = _json.loads(result) if result.startswith("[") else []
@@ -153,7 +160,6 @@ async def lab_page():
                 "nodes": [],
             }
             if lab.get("state") == "STARTED":
-                # Get nodes
                 nodes_result = await mcp.call_tool("get_nodes_for_cml_lab", {"lid": lid})
                 nodes = _json.loads(nodes_result) if nodes_result.startswith("[") else []
                 for node in nodes:
@@ -162,25 +168,19 @@ async def lab_page():
                     nd = node.get("node_definition", "")
                     if nd in ("unmanaged_switch", "external_connector"):
                         continue
-                    # Get management IP via L3 addresses
                     mgmt_ip = ""
                     try:
-                        nid = node.get("id", "")
-                        l3_result = await mcp.call_tool("get_nodes_for_cml_lab", {"lid": lid})
-                        # Try send_cli_command for IP
                         ip_result = await mcp.call_tool("send_cli_command", {
                             "lid": lid, "label": node.get("label", ""),
                             "commands": "show ip interface brief | include Ethernet0/0"
                         })
-                        # Parse: "Ethernet0/0  192.168.255.x  YES DHCP  up  up"
                         for line in ip_result.split("\n"):
-                            if "Ethernet0/0" in line and "DHCP" in line:
+                            if "Ethernet0/0" in line:
                                 parts = line.split()
-                                if len(parts) >= 2:
+                                if len(parts) >= 2 and parts[1][0].isdigit():
                                     mgmt_ip = parts[1]
                     except Exception:
                         pass
-
                     lab_info["nodes"].append({
                         "label": node.get("label", "?"),
                         "state": node.get("state", "?"),
@@ -190,6 +190,30 @@ async def lab_page():
             lab_data["labs"].append(lab_info)
     except Exception as e:
         lab_data["error"] = str(e)
+
+    from datetime import datetime
+    lab_data["last_updated"] = datetime.now().strftime("%H:%M:%S")
+    async with _cache_lock:
+        _lab_cache.update(lab_data)
+    logger.info(f"Lab cache refreshed: {len(lab_data['labs'])} labs")
+
+
+async def _refresh_lab_cache_loop() -> None:
+    """Background loop to refresh lab cache every 30 seconds."""
+    await asyncio.sleep(2)  # wait for MCP to be ready
+    while True:
+        try:
+            await _refresh_lab_cache()
+        except Exception as e:
+            logger.warning(f"Lab cache refresh error: {e}")
+        await asyncio.sleep(30)
+
+
+@app.get("/lab", response_class=HTMLResponse)
+async def lab_page():
+    """Show current lab state with management IPs (served from cache)."""
+    async with _cache_lock:
+        lab_data = dict(_lab_cache)
 
     # Render HTML
     html = """<!DOCTYPE html>
@@ -272,7 +296,7 @@ function copyTable() {
   <span>hacker</span> / BreakMe123 &nbsp;(audience access)<br>
   <span>herbie</span> / H3rb13!Ops &nbsp;(operations access)
 </div>
-<p style="color:#64748b;font-size:0.8em">Auto-refreshes every 30 seconds</p>
+<p style="color:#64748b;font-size:0.8em">Last updated: {lab_data.get("last_updated", "loading...")} — auto-refreshes every 30 seconds</p>
 </body></html>'''
 
     return HTMLResponse(content=html)
@@ -280,52 +304,28 @@ function copyTable() {
 
 @app.get("/lab/json")
 async def lab_json():
-    """API endpoint for lab data — returns JSON with management IPs."""
-    import json as _json
+    """API endpoint for lab data — returns cached JSON with management IPs."""
+    async with _cache_lock:
+        data = dict(_lab_cache)
+    # Reshape for API consumers (like Herbie)
     labs = []
-    try:
-        result = await mcp.call_tool("get_cml_labs", {})
-        raw_labs = _json.loads(result) if result.startswith("[") else []
-        for lab in raw_labs:
-            if not isinstance(lab, dict) or lab.get("state") != "STARTED":
-                continue
-            lid = lab.get("id", "")
-            nodes_result = await mcp.call_tool("get_nodes_for_cml_lab", {"lid": lid})
-            nodes = _json.loads(nodes_result) if nodes_result.startswith("[") else []
-            device_list = []
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-                nd = node.get("node_definition", "")
-                if nd in ("unmanaged_switch", "external_connector"):
-                    continue
-                mgmt_ip = ""
-                try:
-                    ip_result = await mcp.call_tool("send_cli_command", {
-                        "lid": lid, "label": node.get("label", ""),
-                        "commands": "show ip interface brief | include Ethernet0/0"
-                    })
-                    for line in ip_result.split("\n"):
-                        if "Ethernet0/0" in line and "DHCP" in line:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                mgmt_ip = parts[1]
-                except Exception:
-                    pass
-                device_list.append({
-                    "hostname": node.get("label", ""),
-                    "mgmt_ip": mgmt_ip,
-                    "state": node.get("state", ""),
-                })
-            labs.append({
-                "id": lid,
-                "title": lab.get("lab_title", ""),
-                "devices": device_list,
-                "ssh_users": {"hacker": "BreakMe123", "herbie": "H3rb13!Ops"},
-            })
-    except Exception as e:
-        return {"error": str(e)}
-    return {"labs": labs}
+    for lab in data.get("labs", []):
+        if lab.get("state") != "STARTED":
+            continue
+        labs.append({
+            "id": lab["id"],
+            "title": lab["title"],
+            "devices": [{"hostname": n["label"], "mgmt_ip": n["mgmt_ip"], "state": n["state"]} for n in lab.get("nodes", [])],
+            "ssh_users": {"hacker": "BreakMe123", "herbie": "H3rb13!Ops"},
+        })
+    return {"labs": labs, "last_updated": data.get("last_updated")}
+
+
+@app.post("/lab/refresh")
+async def lab_refresh():
+    """Force refresh the lab cache."""
+    asyncio.create_task(_refresh_lab_cache())
+    return {"status": "refreshing"}
 
 
 @app.post("/webhook")
